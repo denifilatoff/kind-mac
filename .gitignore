@@ -1,0 +1,8 @@
+# Downloaded istioctl (cached binaries)
+istio-*/
+.cache/
+.claude/
+
+# Local env overrides
+.env
+.env.local

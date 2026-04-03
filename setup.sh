@@ -5,32 +5,70 @@
 #   - Istio service mesh + ingress gateway (host ports 8080/8443)
 #   - cert-manager with a self-signed ClusterIssuer
 #   - local-path-provisioner for persistent host storage
-#   - DNS wildcard *.localhost.localdomain → 127.0.0.1 via NetworkManager/dnsmasq
+#   - DNS wildcard *.localhost.localdomain → 127.0.0.1
+#     macOS:  Homebrew dnsmasq + /etc/resolver/localhost.localdomain
 #   - local Docker registry  (localhost:5001, accessible as kind-registry:5000)
 #
+# Configuration: edit .env (all options documented there).
+#
 # Usage:
-#   ./setup.sh             — create cluster (skip if exists) + install/upgrade all components
-#   ./setup.sh --recreate  — delete cluster and recreate it from scratch (keeps host storage)
+#   ./setup.sh                            — create cluster (skip if exists) + install/upgrade all components
+#   ./setup.sh --recreate --clean-storage — delete cluster and recreate it from scratch (keeps host storage)
+#
+# Optional flags (combine with --recreate):
+#   --clean-storage        — also wipe ${STORAGE_ROOT} for a full clean slate
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KIND_CONFIG="${SCRIPT_DIR}/kind-config.yaml"
 
+# ── Defaults (overridden by .env) ──────────────────────────────────────────────
 CLUSTER_NAME="local-dev"
 LOCAL_REGISTRY_NAME="kind-registry"
-LOCAL_REGISTRY_PORT="5001"   # port on the host; inside kind nodes use kind-registry:5000
+LOCAL_REGISTRY_PORT="5001"
 ISTIO_VERSION="1.23.3"
 CERT_MANAGER_VERSION="v1.16.2"
 STORAGE_ROOT="/var/local-path-provisioner"
+K8S_VERSION="v1.35.0"
+NGINX_HTTP_PORT=80
+NGINX_HTTPS_PORT=443
+ISTIO_HTTP_PORT=8080
+ISTIO_HTTPS_PORT=8443
+ISTIO_NODEPORT_HTTP=30080
+ISTIO_NODEPORT_HTTPS=30443
+MIRRORS=(
+  "https://dockerhub.timeweb.cloud"
+  "https://dockerhub1.beget.com"
+  "https://mirror.gcr.io"
+)
+
+# ── Load .env (overrides defaults above) ──────────────────────────────────────
+[[ -f "${SCRIPT_DIR}/.env" ]] && source "${SCRIPT_DIR}/.env"
+
+# ── Require macOS ─────────────────────────────────────────────────────────────
+[[ "$(uname -s)" == "Darwin" ]] || die "This script requires macOS."
+
+# ── Generate kind cluster config from kind-config.yaml + .env variables ────────
+mkdir -p "${SCRIPT_DIR}/.cache"
+KIND_CONFIG="${SCRIPT_DIR}/.cache/kind-config.yaml"
+export CLUSTER_NAME K8S_VERSION NGINX_HTTP_PORT NGINX_HTTPS_PORT \
+       ISTIO_HTTP_PORT ISTIO_HTTPS_PORT ISTIO_NODEPORT_HTTP ISTIO_NODEPORT_HTTPS \
+       STORAGE_ROOT
+envsubst < "${SCRIPT_DIR}/kind-config.yaml" > "${KIND_CONFIG}"
 
 RECREATE=false
+CLEAN_STORAGE=false
 for arg in "$@"; do
   case "$arg" in
-    --recreate) RECREATE=true ;;
+    --recreate)       RECREATE=true ;;
+    --clean-storage)  CLEAN_STORAGE=true ;;
     *) echo "Unknown argument: $arg"; exit 1 ;;
   esac
 done
+
+if [[ "${CLEAN_STORAGE}" == "true" && "${RECREATE}" == "false" ]]; then
+  die "--clean-storage requires --recreate"
+fi
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -40,7 +78,7 @@ warn() { echo -e "\033[1;33m  ! $*\033[0m"; }
 die()  { echo -e "\033[1;31m  ✗ $*\033[0m" >&2; exit 1; }
 
 require() {
-  command -v "$1" &>/dev/null || die "'$1' not found. Install it first (dnf install $1)."
+  command -v "$1" &>/dev/null || die "'$1' not found. Install it first (brew install $1  or  dnf install $1)."
 }
 
 wait_for_rollout() {
@@ -57,40 +95,55 @@ require helm
 require docker
 ok "kind, kubectl, helm, docker — all found"
 
-# ── istioctl: find or download ─────────────────────────────────────────────
+# ── istioctl: find in PATH, local cache, or download once ────────────────────
+#
+# Priority: system PATH → .cache/istioctl-<version> → download and cache
 
+ISTIOCTL_CACHE="${SCRIPT_DIR}/.cache/istioctl-${ISTIO_VERSION}"
 ISTIOCTL="$(command -v istioctl 2>/dev/null || true)"
 
 if [[ -z "${ISTIOCTL}" ]]; then
-  ISTIO_BIN="${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin/istioctl"
-  if [[ -x "${ISTIO_BIN}" ]]; then
-    ISTIOCTL="${ISTIO_BIN}"
-    ok "Found local istioctl at ${ISTIO_BIN}"
+  if [[ -x "${ISTIOCTL_CACHE}" ]]; then
+    ISTIOCTL="${ISTIOCTL_CACHE}"
+    ok "istioctl ${ISTIO_VERSION} found in cache"
   else
-    log "Downloading istioctl ${ISTIO_VERSION}"
+    log "Downloading istioctl ${ISTIO_VERSION} (one-time, cached to .cache/)"
+    TARGET_ARCH="$(uname -m)"
+    ISTIO_TMP="$(mktemp -d /tmp/istio-XXXXXX)"
+    trap 'rm -rf "${ISTIO_TMP}"' EXIT
     curl -sSL https://istio.io/downloadIstio \
-      | ISTIO_VERSION="${ISTIO_VERSION}" TARGET_ARCH=x86_64 sh - 2>&1
-    ISTIOCTL="${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin/istioctl"
-    ok "istioctl downloaded to ${ISTIOCTL}"
-    warn "Add to PATH permanently: export PATH=\"${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin:\$PATH\""
+      | ISTIO_VERSION="${ISTIO_VERSION}" TARGET_ARCH="${TARGET_ARCH}" sh - 2>&1
+    mkdir -p "${SCRIPT_DIR}/.cache"
+    cp "${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin/istioctl" "${ISTIOCTL_CACHE}"
+    rm -rf "${SCRIPT_DIR}/istio-${ISTIO_VERSION}"
+    ISTIOCTL="${ISTIOCTL_CACHE}"
+    ok "istioctl ${ISTIO_VERSION} downloaded and cached"
   fi
 fi
 export PATH="$(dirname "${ISTIOCTL}"):${PATH}"
 
 # ── DNS check ─────────────────────────────────────────────────────────────
 
-log "Checking DNS: *.localhost.localdomain → 127.0.0.1 / ::1"
+log "Checking DNS: *.localhost.localdomain → 127.0.0.1"
 
-if getent hosts test.localhost.localdomain &>/dev/null; then
-  ok "DNS wildcard resolves: $(getent hosts test.localhost.localdomain)"
+dns_resolves() {
+  # dig bypasses /etc/resolver on macOS; dscacheutil uses the system resolver stack
+  dscacheutil -q host -a name test.localhost.localdomain 2>/dev/null | grep -q "127.0.0.1"
+}
+
+if dns_resolves; then
+  ok "DNS wildcard resolves (*.localhost.localdomain → 127.0.0.1)"
 else
   warn "*.localhost.localdomain does not resolve."
-  warn "Run the following once as root, then re-run this script:"
   echo
-  echo "  sudo mkdir -p /etc/NetworkManager/conf.d /etc/NetworkManager/dnsmasq.d"
-  echo "  echo -e '[main]\ndns=dnsmasq' | sudo tee /etc/NetworkManager/conf.d/dnsmasq.conf"
-  echo "  echo 'address=/.localhost.localdomain/127.0.0.1' | sudo tee /etc/NetworkManager/dnsmasq.d/localhost-localdomain.conf"
-  echo "  sudo systemctl reload NetworkManager"
+  warn "Run the following once (requires sudo), then re-run this script:"
+  echo
+  echo "  brew install dnsmasq"
+  echo "  echo 'address=/.localhost.localdomain/127.0.0.1' >> \$(brew --prefix)/etc/dnsmasq.conf"
+  echo "  sudo brew services start dnsmasq"
+  echo "  sudo mkdir -p /etc/resolver"
+  echo "  echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/localhost.localdomain"
+  echo "  sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
   echo
   die "Fix DNS first."
 fi
@@ -114,6 +167,12 @@ if [[ "${RECREATE}" == "true" && "${CLUSTER_EXISTS}" == "true" ]]; then
   log "Deleting existing cluster '${CLUSTER_NAME}' (--recreate)"
   kind delete cluster --name "${CLUSTER_NAME}"
   CLUSTER_EXISTS=false
+fi
+
+if [[ "${CLEAN_STORAGE}" == "true" ]]; then
+  log "Wiping host storage root: ${STORAGE_ROOT} (--clean-storage)"
+  rm -rf "${STORAGE_ROOT:?}"/*
+  ok "Storage root wiped"
 fi
 
 if [[ "${CLUSTER_EXISTS}" == "false" ]]; then
@@ -195,11 +254,7 @@ ok "local-registry-hosting ConfigMap applied (kube-public/local-registry-hosting
 # restarting containerd — this is the correct method for containerd v2.
 # The MIRRORS array can be edited freely; --recreate is NOT required.
 
-MIRRORS=(
-  "https://dockerhub.timeweb.cloud"
-  "https://dockerhub1.beget.com"
-  "https://mirror.gcr.io"
-)
+# MIRRORS comes from .env (or the defaults set at the top of this script)
 
 configure_mirrors() {
   local node="$1"
@@ -406,20 +461,20 @@ ok "Istio control plane installed"
 
 # ── Istio ingress gateway NodePorts ───────────────────────────────────────
 
-log "Configuring Istio ingress gateway NodePorts (30080→8080, 30443→8443)"
+log "Configuring Istio ingress gateway NodePorts (${ISTIO_NODEPORT_HTTP}→${ISTIO_HTTP_PORT}, ${ISTIO_NODEPORT_HTTPS}→${ISTIO_HTTPS_PORT})"
 
 # The demo profile creates the service with LoadBalancer type and existing ports.
 # We replace the port list entirely with the ports we need + fixed NodePorts.
-kubectl patch svc istio-ingressgateway -n istio-system --type=json -p='[
-  {"op":"replace","path":"/spec/type","value":"NodePort"},
-  {"op":"replace","path":"/spec/ports","value":[
-    {"name":"status-port","port":15021,"targetPort":15021,"protocol":"TCP"},
-    {"name":"http2",      "port":80,   "targetPort":8080, "nodePort":30080,"protocol":"TCP"},
-    {"name":"https",      "port":443,  "targetPort":8443, "nodePort":30443,"protocol":"TCP"}
+kubectl patch svc istio-ingressgateway -n istio-system --type=json -p="[
+  {\"op\":\"replace\",\"path\":\"/spec/type\",\"value\":\"NodePort\"},
+  {\"op\":\"replace\",\"path\":\"/spec/ports\",\"value\":[
+    {\"name\":\"status-port\",\"port\":15021,\"targetPort\":15021,\"protocol\":\"TCP\"},
+    {\"name\":\"http2\",\"port\":80,\"targetPort\":8080,\"nodePort\":${ISTIO_NODEPORT_HTTP},\"protocol\":\"TCP\"},
+    {\"name\":\"https\",\"port\":443,\"targetPort\":8443,\"nodePort\":${ISTIO_NODEPORT_HTTPS},\"protocol\":\"TCP\"}
   ]}
-]'
+]"
 
-ok "Istio ingress gateway → NodePort 30080 (HTTP) / 30443 (HTTPS)"
+ok "Istio ingress gateway → NodePort ${ISTIO_NODEPORT_HTTP} (HTTP) / ${ISTIO_NODEPORT_HTTPS} (HTTPS)"
 
 # ── Wildcard TLS cert for Istio gateway ───────────────────────────────────
 #
@@ -501,12 +556,12 @@ cat <<SUMMARY
 
   nginx Ingress (standard Ingress resources):
     HTTP   →  http://<name>.localhost.localdomain
-    HTTPS  →  https://<name>.localhost.localdomain   (port 443)
+    HTTPS  →  https://<name>.localhost.localdomain   (port ${NGINX_HTTPS_PORT})
     Annotation for TLS:  cert-manager.io/cluster-issuer: local-ca-issuer
 
   Istio Ingress Gateway (Gateway + VirtualService):
-    HTTP   →  http://<name>.localhost.localdomain:8080
-    HTTPS  →  https://<name>.localhost.localdomain:8443
+    HTTP   →  http://<name>.localhost.localdomain:${ISTIO_HTTP_PORT}
+    HTTPS  →  https://<name>.localhost.localdomain:${ISTIO_HTTPS_PORT}
 
   Local registry (push once, all nodes pull):
     Build : ./kbuild <image>:<tag> <context_path>
@@ -517,8 +572,9 @@ cat <<SUMMARY
     Host path    : ${STORAGE_ROOT}
 
   Re-run modes:
-    ./setup.sh             — upgrade components in-place
-    ./setup.sh --recreate  — delete + recreate cluster (keeps host storage)
+    ./setup.sh                            — upgrade components in-place
+    ./setup.sh --recreate                 — delete + recreate cluster (keeps host storage)
+    ./setup.sh --recreate --clean-storage — delete + recreate cluster + wipe ${STORAGE_ROOT}
 
   Local images — build and push in one step:
     ./kbuild my-service:latest .

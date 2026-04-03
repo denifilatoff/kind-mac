@@ -20,7 +20,9 @@ set -euo pipefail
 # even when the domain is listed in NO_PROXY (wildcard matching quirk in curl).
 unset http_proxy HTTP_PROXY https_proxy HTTPS_PROXY all_proxy ALL_PROXY
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CLUSTER_NAME="local-dev"
+[[ -f "${SCRIPT_DIR}/.env" ]] && source "${SCRIPT_DIR}/.env"
 NS="smoke-test"
 PASS=0
 FAIL=0
@@ -178,8 +180,8 @@ pass "Smoke resources deployed"
 
 log "1. DNS wildcard (*.localhost.localdomain)"
 
-if getent hosts echo.localhost.localdomain | grep -qE '127\.0\.0\.1|::1'; then
-  RESOLVED=$(getent hosts echo.localhost.localdomain | awk '{print $1}' | head -1)
+if dscacheutil -q host -a name echo.localhost.localdomain 2>/dev/null | grep -qE '127\.0\.0\.1|::1'; then
+  RESOLVED=$(dscacheutil -q host -a name echo.localhost.localdomain 2>/dev/null | awk '/ip_address:/{print $2}' | head -1)
   pass "Resolves → ${RESOLVED}"
 else
   fail "echo.localhost.localdomain did not resolve"
