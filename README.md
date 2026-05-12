@@ -6,11 +6,11 @@
 
 A script-driven local Kubernetes cluster for development on macOS. One command gives you:
 
-- **kind** cluster (1 control-plane + 2 workers)
-- **Istio** service mesh + single ingress gateway on ports 80/443 (serves HTTPRoute, classic Ingress, and Istio Gateway+VirtualService)
-- **cert-manager** with a self-signed CA (automatic TLS for any `*.localhost.localdomain` hostname)
-- **local Docker registry** on `localhost:5001` (no `kind load` needed)
-- **persistent storage** backed by a host directory
+- **kind** cluster (1 control-plane + 2 workers) — always
+- **persistent storage** backed by a host directory — always
+- **Istio** service mesh + single ingress gateway on ports 80/443 (HTTPRoute, classic Ingress, Istio Gateway+VirtualService) — optional, `ENABLE_INGRESS`
+- **cert-manager** with a self-signed CA (automatic TLS for `*.localhost.localdomain`) — part of ingress
+- **local Docker registry** on `localhost:5001` (no `kind load` needed) — optional, `ENABLE_REGISTRY`
 
 ---
 
@@ -165,7 +165,14 @@ MIRRORS=(
   "https://dockerhub1.beget.com"
   "https://mirror.gcr.io"
 )
+
+# Feature toggles — set to "false" to skip a whole block of components
+ENABLE_INGRESS=true    # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
+ENABLE_REGISTRY=true   # local kind-registry + Docker Hub mirrors + containerd no-proxy
 ```
+
+Precedence: **env var > `.env` > in-script default**. So you can pin a flag in
+`.env` and still override it for a one-off run via the command line.
 
 ---
 
@@ -203,6 +210,30 @@ kind delete cluster --name my-cluster
 > Running multiple kind clusters at once requires unique `ISTIO_HTTP_PORT` /
 > `ISTIO_HTTPS_PORT` values per cluster — only one cluster can bind host
 > ports 80/443 at a time.
+
+### Optional features
+
+Two large blocks of `setup.sh` can be skipped via flags. Persistent storage
+and the kind cluster itself are always created.
+
+| Flag | Default | What it controls |
+|------|---------|------------------|
+| `ENABLE_INGRESS` | `true` | DNS-wildcard check, `istioctl` auto-download, cert-manager + self-signed CA, Gateway API CRDs, Istio control plane, `IngressClass istio`, shared `Gateway`, wildcard TLS secret, RBAC for `gateway-istio`, NodePort patch, ServiceMonitor CRD |
+| `ENABLE_REGISTRY` | `true` | `kind-registry` container + KEP-1755 ConfigMap, Docker Hub mirrors, containerd no-proxy override, `localhost:5001` → `kind-registry:5000` redirect |
+
+```bash
+# Skip the whole ingress stack — leaves a bare cluster + storage + local registry
+ENABLE_INGRESS=false ./setup.sh --recreate
+
+# Skip the local registry block — leaves a bare cluster + storage + ingress
+ENABLE_REGISTRY=false ./setup.sh --recreate
+
+# Both off — minimal cluster: just kind nodes + local-path-provisioner
+ENABLE_INGRESS=false ENABLE_REGISTRY=false ./setup.sh --recreate
+```
+
+The smoke test assumes ingress is on; with `ENABLE_INGRESS=false` it will
+fail on the HTTPRoute and Istio-sidecar checks.
 
 ---
 
