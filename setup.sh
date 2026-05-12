@@ -46,9 +46,11 @@ MIRRORS=(
   "https://mirror.gcr.io"
 )
 
-# Optional feature toggles — set to "false" in .env to skip the corresponding block
-ENABLE_INGRESS=true   # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
-ENABLE_REGISTRY=true  # local kind-registry container + KEP-1755 ConfigMap + Docker Hub mirrors + containerd no-proxy
+# Optional feature toggles — set to "false" in .env or via env var to skip the block.
+# Using ${VAR:-default} so environment values (e.g. ENABLE_INGRESS=false ./setup.sh)
+# take precedence over the in-script defaults; .env (sourced below) overrides both.
+ENABLE_INGRESS="${ENABLE_INGRESS:-true}"   # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
+ENABLE_REGISTRY="${ENABLE_REGISTRY:-true}" # local kind-registry container + KEP-1755 ConfigMap + Docker Hub mirrors + containerd no-proxy
 
 # ── Load .env (overrides defaults above) ──────────────────────────────────────
 [[ -f "${SCRIPT_DIR}/.env" ]] && source "${SCRIPT_DIR}/.env"
