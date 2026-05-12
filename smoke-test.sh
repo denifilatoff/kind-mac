@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# smoke-test.sh — Verify the local-dev kind cluster is working correctly.
+# smoke-test.sh — Verify the kind cluster (name from .env: CLUSTER_NAME) is working correctly.
 #
 # Tests:
 #   1. DNS wildcard resolution

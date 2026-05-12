@@ -423,7 +423,7 @@ log "Creating self-signed ClusterIssuers"
 # Wait for cert-manager webhook to be ready
 kubectl rollout status deployment/cert-manager-webhook -n cert-manager --timeout=2m
 
-kubectl apply -f - <<'EOF'
+kubectl apply -f - <<EOF
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -438,7 +438,7 @@ metadata:
   namespace: cert-manager
 spec:
   isCA: true
-  commonName: local-dev-ca
+  commonName: ${CLUSTER_NAME}-ca
   secretName: local-ca-secret
   privateKey:
     algorithm: ECDSA
