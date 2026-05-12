@@ -18,6 +18,10 @@
 #
 # Optional flags (combine with --recreate):
 #   --clean-storage        — also wipe ${STORAGE_ROOT} for a full clean slate
+#
+# Feature toggles (set in .env):
+#   ENABLE_INGRESS=true    — install cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD
+#   ENABLE_REGISTRY=true   — start local kind-registry + Docker Hub mirrors + containerd no-proxy + localhost:5001 redirect
 # ---------------------------------------------------------------------------
 set -euo pipefail
 
@@ -41,6 +45,10 @@ MIRRORS=(
   "https://dockerhub1.beget.com"
   "https://mirror.gcr.io"
 )
+
+# Optional feature toggles — set to "false" in .env to skip the corresponding block
+ENABLE_INGRESS=true   # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
+ENABLE_REGISTRY=true  # local kind-registry container + KEP-1755 ConfigMap + Docker Hub mirrors + containerd no-proxy
 
 # ── Load .env (overrides defaults above) ──────────────────────────────────────
 [[ -f "${SCRIPT_DIR}/.env" ]] && source "${SCRIPT_DIR}/.env"
@@ -105,57 +113,60 @@ require helm
 require docker
 ok "kind, kubectl, helm, docker — all found"
 
-# ── istioctl: find in PATH, local cache, or download once ────────────────────
-#
-# Priority: system PATH → .cache/istioctl-<version> → download and cache
+# ── Ingress prerequisites (istioctl + DNS) — only if ENABLE_INGRESS=true ─────
 
-ISTIOCTL_CACHE="${SCRIPT_DIR}/.cache/istioctl-${ISTIO_VERSION}"
-ISTIOCTL="$(command -v istioctl 2>/dev/null || true)"
+if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+  # ── istioctl: find in PATH, local cache, or download once ────────────────
+  # Priority: system PATH → .cache/istioctl-<version> → download and cache
+  ISTIOCTL_CACHE="${SCRIPT_DIR}/.cache/istioctl-${ISTIO_VERSION}"
+  ISTIOCTL="$(command -v istioctl 2>/dev/null || true)"
 
-if [[ -z "${ISTIOCTL}" ]]; then
-  if [[ -x "${ISTIOCTL_CACHE}" ]]; then
-    ISTIOCTL="${ISTIOCTL_CACHE}"
-    ok "istioctl ${ISTIO_VERSION} found in cache"
-  else
-    log "Downloading istioctl ${ISTIO_VERSION} (one-time, cached to .cache/)"
-    TARGET_ARCH="$(uname -m)"
-    ISTIO_TMP="$(mktemp -d /tmp/istio-XXXXXX)"
-    trap 'rm -rf "${ISTIO_TMP}"' EXIT
-    curl -sSL https://istio.io/downloadIstio \
-      | ISTIO_VERSION="${ISTIO_VERSION}" TARGET_ARCH="${TARGET_ARCH}" sh - 2>&1
-    mkdir -p "${SCRIPT_DIR}/.cache"
-    cp "${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin/istioctl" "${ISTIOCTL_CACHE}"
-    rm -rf "${SCRIPT_DIR}/istio-${ISTIO_VERSION}"
-    ISTIOCTL="${ISTIOCTL_CACHE}"
-    ok "istioctl ${ISTIO_VERSION} downloaded and cached"
+  if [[ -z "${ISTIOCTL}" ]]; then
+    if [[ -x "${ISTIOCTL_CACHE}" ]]; then
+      ISTIOCTL="${ISTIOCTL_CACHE}"
+      ok "istioctl ${ISTIO_VERSION} found in cache"
+    else
+      log "Downloading istioctl ${ISTIO_VERSION} (one-time, cached to .cache/)"
+      TARGET_ARCH="$(uname -m)"
+      ISTIO_TMP="$(mktemp -d /tmp/istio-XXXXXX)"
+      trap 'rm -rf "${ISTIO_TMP}"' EXIT
+      curl -sSL https://istio.io/downloadIstio \
+        | ISTIO_VERSION="${ISTIO_VERSION}" TARGET_ARCH="${TARGET_ARCH}" sh - 2>&1
+      mkdir -p "${SCRIPT_DIR}/.cache"
+      cp "${SCRIPT_DIR}/istio-${ISTIO_VERSION}/bin/istioctl" "${ISTIOCTL_CACHE}"
+      rm -rf "${SCRIPT_DIR}/istio-${ISTIO_VERSION}"
+      ISTIOCTL="${ISTIOCTL_CACHE}"
+      ok "istioctl ${ISTIO_VERSION} downloaded and cached"
+    fi
   fi
-fi
-export PATH="$(dirname "${ISTIOCTL}"):${PATH}"
+  export PATH="$(dirname "${ISTIOCTL}"):${PATH}"
 
-# ── DNS check ─────────────────────────────────────────────────────────────
+  # ── DNS check ──────────────────────────────────────────────────────────────
+  log "Checking DNS: *.localhost.localdomain → 127.0.0.1"
 
-log "Checking DNS: *.localhost.localdomain → 127.0.0.1"
+  dns_resolves() {
+    # dig bypasses /etc/resolver on macOS; dscacheutil uses the system resolver stack
+    dscacheutil -q host -a name test.localhost.localdomain 2>/dev/null | grep -q "127.0.0.1"
+  }
 
-dns_resolves() {
-  # dig bypasses /etc/resolver on macOS; dscacheutil uses the system resolver stack
-  dscacheutil -q host -a name test.localhost.localdomain 2>/dev/null | grep -q "127.0.0.1"
-}
-
-if dns_resolves; then
-  ok "DNS wildcard resolves (*.localhost.localdomain → 127.0.0.1)"
+  if dns_resolves; then
+    ok "DNS wildcard resolves (*.localhost.localdomain → 127.0.0.1)"
+  else
+    warn "*.localhost.localdomain does not resolve."
+    echo
+    warn "Run the following once (requires sudo), then re-run this script:"
+    echo
+    echo "  brew install dnsmasq"
+    echo "  echo 'address=/.localhost.localdomain/127.0.0.1' >> \$(brew --prefix)/etc/dnsmasq.conf"
+    echo "  sudo brew services start dnsmasq"
+    echo "  sudo mkdir -p /etc/resolver"
+    echo "  echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/localhost.localdomain"
+    echo "  sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
+    echo
+    die "Fix DNS first."
+  fi
 else
-  warn "*.localhost.localdomain does not resolve."
-  echo
-  warn "Run the following once (requires sudo), then re-run this script:"
-  echo
-  echo "  brew install dnsmasq"
-  echo "  echo 'address=/.localhost.localdomain/127.0.0.1' >> \$(brew --prefix)/etc/dnsmasq.conf"
-  echo "  sudo brew services start dnsmasq"
-  echo "  sudo mkdir -p /etc/resolver"
-  echo "  echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/localhost.localdomain"
-  echo "  sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder"
-  echo
-  die "Fix DNS first."
+  warn "Skipping ingress prerequisites (ENABLE_INGRESS=false)"
 fi
 
 # ── storage root ───────────────────────────────────────────────────────────
@@ -239,13 +250,14 @@ connect_registry_to_kind_network() {
   fi
 }
 
-log "Starting local Docker registry"
-start_local_registry
-connect_registry_to_kind_network
+if [[ "${ENABLE_REGISTRY}" == "true" ]]; then
+  log "Starting local Docker registry"
+  start_local_registry
+  connect_registry_to_kind_network
 
-# Advertise the registry via the KEP-1755 standard ConfigMap so tools like
-# Tilt and Skaffold can discover it automatically.
-kubectl apply -f - >/dev/null <<EOF
+  # Advertise the registry via the KEP-1755 standard ConfigMap so tools like
+  # Tilt and Skaffold can discover it automatically.
+  kubectl apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -256,7 +268,10 @@ data:
     host: "localhost:${LOCAL_REGISTRY_PORT}"
     help: "https://kind.sigs.k8s.io/docs/user/local-registry/"
 EOF
-ok "local-registry-hosting ConfigMap applied (kube-public/local-registry-hosting)"
+  ok "local-registry-hosting ConfigMap applied (kube-public/local-registry-hosting)"
+else
+  warn "Skipping local Docker registry (ENABLE_REGISTRY=false)"
+fi
 
 # ── Registry mirrors (containerd v2 hosts.toml) ────────────────────────────
 #
@@ -333,11 +348,15 @@ CONF
   " 2>&1 | sed "s/^/  [${node}] /"
 }
 
-log "Configuring Docker Hub mirrors on all kind nodes"
-for node in $(kind get nodes --name "${CLUSTER_NAME}"); do
-  configure_mirrors "${node}"
-done
-ok "Registry mirrors configured"
+if [[ "${ENABLE_REGISTRY}" == "true" ]]; then
+  log "Configuring Docker Hub mirrors + local registry redirect on all kind nodes"
+  for node in $(kind get nodes --name "${CLUSTER_NAME}"); do
+    configure_mirrors "${node}"
+  done
+  ok "Registry mirrors configured"
+else
+  warn "Skipping registry mirrors / containerd config (ENABLE_REGISTRY=false)"
+fi
 
 # ── local-path-provisioner ─────────────────────────────────────────────────
 
@@ -372,7 +391,14 @@ fi
 
 ok "local-path-provisioner configured (storage root: ${STORAGE_ROOT})"
 
-# ── nginx ingress controller ───────────────────────────────────────────────
+# ── Ingress stack (cert-manager + Gateway API + Istio + …) ────────────────
+#
+# Single ENABLE_INGRESS gate wraps every ingress-related install step below.
+# Skipping leaves only the bare kind cluster + local-path-provisioner +
+# (optionally) the local registry.
+
+if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+
 log "Installing ServiceMonitor CRD"
 kubectl_apply_url https://github.com/Netcracker/qubership-monitoring-operator/raw/refs/heads/main/charts/qubership-monitoring-crds/crds/monitoring.coreos.com_servicemonitors.yaml
 
@@ -651,6 +677,10 @@ kubectl patch svc gateway-istio -n istio-system --type=json -p="[
 ]"
 ok "gateway-istio → NodePort ${ISTIO_NODEPORT_HTTP} (HTTP→host:${ISTIO_HTTP_PORT}) / ${ISTIO_NODEPORT_HTTPS} (HTTPS→host:${ISTIO_HTTPS_PORT})"
 
+else
+  warn "Skipping ingress stack: cert-manager, Gateway API, Istio, IngressClass, wildcard TLS, RBAC, NodePort patch, ServiceMonitor CRD (ENABLE_INGRESS=false)"
+fi
+
 # ── Verify ────────────────────────────────────────────────────────────────
 
 log "Verifying cluster components"
@@ -675,10 +705,12 @@ check_deployment() {
 }
 
 check_deployment local-path-storage   local-path-provisioner
-check_deployment cert-manager         cert-manager
-check_deployment cert-manager         cert-manager-webhook
-check_deployment istio-system         istiod
-check_deployment istio-system         gateway-istio
+if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+  check_deployment cert-manager         cert-manager
+  check_deployment cert-manager         cert-manager-webhook
+  check_deployment istio-system         istiod
+  check_deployment istio-system         gateway-istio
+fi
 
 echo
 kubectl get storageclass
@@ -691,6 +723,12 @@ cat <<SUMMARY
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
   Cluster '${CLUSTER_NAME}' is ready
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Features: ingress=${ENABLE_INGRESS}  registry=${ENABLE_REGISTRY}
+SUMMARY
+
+if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+cat <<SUMMARY
 
   Single gateway (gateway-istio in istio-system) handles all traffic on ${ISTIO_HTTP_PORT}/${ISTIO_HTTPS_PORT}.
 
@@ -707,10 +745,19 @@ cat <<SUMMARY
     HTTP   →  http://<name>.localhost.localdomain:${ISTIO_HTTP_PORT}
     HTTPS  →  https://<name>.localhost.localdomain:${ISTIO_HTTPS_PORT}
     TLS credential: istio-gw-tls  (secret in istio-system)
+SUMMARY
+fi
+
+if [[ "${ENABLE_REGISTRY}" == "true" ]]; then
+cat <<SUMMARY
 
   Local registry (push once, all nodes pull):
     Build : ./kbuild <image>:<tag> <context_path>
     In pod: image: localhost:${LOCAL_REGISTRY_PORT}/<image>:<tag>
+SUMMARY
+fi
+
+cat <<SUMMARY
 
   Storage:
     StorageClass : local-path (default)
@@ -720,10 +767,6 @@ cat <<SUMMARY
     ./setup.sh                            — upgrade components in-place
     ./setup.sh --recreate                 — delete + recreate cluster (keeps host storage)
     ./setup.sh --recreate --clean-storage — delete + recreate cluster + wipe ${STORAGE_ROOT}
-
-  Local images — build and push in one step:
-    ./kbuild my-service:latest .
-    # In pod spec: image: localhost:${LOCAL_REGISTRY_PORT}/my-service:latest
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 SUMMARY
