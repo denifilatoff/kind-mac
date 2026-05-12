@@ -7,8 +7,7 @@
 A script-driven local Kubernetes cluster for development on macOS. One command gives you:
 
 - **kind** cluster (1 control-plane + 2 workers)
-- **nginx ingress** on ports 80/443
-- **Istio** service mesh + ingress gateway on ports 8080/8443
+- **Istio** service mesh + single ingress gateway on ports 80/443 (serves HTTPRoute, classic Ingress, and Istio Gateway+VirtualService)
 - **cert-manager** with a self-signed CA (automatic TLS for any `*.localhost.localdomain` hostname)
 - **local Docker registry** on `localhost:5001` (no `kind load` needed)
 - **persistent storage** backed by a host directory
@@ -47,22 +46,28 @@ cp .env.example .env
 ```
 macOS host
   *.localhost.localdomain → 127.0.0.1  (dnsmasq)
-        │
-        ├── :80 / :443   ──► kind node hostPort ──► nginx ingress controller
-        │                                            (Ingress resources)
-        │
-        └── :8080 / :8443 ─► kind node NodePort ──► Istio ingress gateway
-                              30080  /  30443         (Gateway + VirtualService)
+       │
+       └── :80 / :443  ──► kind node NodePort ──► gateway-istio (istio-system)
+                            30080 / 30443          ├── HTTPRoute  (Gateway API)
+                                                   ├── Ingress    (ingressClassName: istio)
+                                                   └── Gateway + VirtualService (Istio native)
 
   localhost:5001  ──► kind-registry container ──► all kind nodes (containerd mirror)
 ```
 
-| Entry point     | Host port    | Used for                             |
-|-----------------|--------------|--------------------------------------|
-| nginx ingress   | 80 / **443** | Standard `Ingress` resources         |
-| Istio gateway   | 8080 / 8443  | `Gateway` + `VirtualService`         |
-| Local registry  | 5001         | Push images, pods pull automatically |
-| Storage         | —            | `/var/local-path-provisioner`        |
+| Entry point                     | Host port    | Used for                                   |
+|---------------------------------|--------------|--------------------------------------------|
+| `gateway-istio` (istio-system)  | 80 / **443** | `HTTPRoute` · `Ingress` · `VirtualService` |
+| Local registry                  | 5001         | Push images, pods pull automatically       |
+| Storage                         | —            | `/var/local-path-provisioner`              |
+
+A single `istio-system/gateway` Gateway accepts HTTPRoutes from **any namespace**
+on HTTP (:80) and HTTPS (:443). TLS is terminated using the wildcard cert
+`istio-system/istio-gw-tls` (issued by `local-ca-issuer`).
+
+Classic `Ingress` resources (`ingressClassName: istio`) and Istio-native
+`Gateway`+`VirtualService` are also served by the same `gateway-istio` pod
+(configured via `meshConfig.ingressService=gateway-istio` in Istiod).
 
 ---
 
@@ -174,6 +179,31 @@ MIRRORS=(
 ./setup.sh --recreate
 ```
 
+### Custom cluster name
+
+By default the cluster is named `local-dev` (from `.env.example`). To create
+a cluster with a different name, override `CLUSTER_NAME` — either edit `.env`
+or pass it inline for a one-off run:
+
+```bash
+# Option 1: edit .env permanently
+echo 'CLUSTER_NAME=my-cluster' >> .env
+./setup.sh
+
+# Option 2: inline override (does not modify .env)
+CLUSTER_NAME=my-cluster ./setup.sh
+
+# Switch kubectl context to the new cluster
+kubectl config use-context kind-my-cluster
+
+# Tear it down later (must pass the same name)
+kind delete cluster --name my-cluster
+```
+
+> Running multiple kind clusters at once requires unique `ISTIO_HTTP_PORT` /
+> `ISTIO_HTTPS_PORT` values per cluster — only one cluster can bind host
+> ports 80/443 at a time.
+
 ---
 
 ## Smoke test
@@ -184,8 +214,8 @@ Verifies all cluster components are working correctly:
 ./smoke-test.sh
 ```
 
-Checks: DNS resolution, nginx HTTP→HTTPS redirect, nginx HTTPS with cert-manager TLS,
-Istio HTTP/HTTPS ingress, PVC provisioning, and Istio sidecar injection.
+Checks: DNS resolution, Istio HTTP/HTTPS ingress (Gateway API + classic Ingress),
+PVC provisioning, and Istio sidecar injection.
 
 Creates a temporary `smoke-test` namespace, runs the tests, and deletes the namespace
 on success. On failure it leaves resources in place for investigation.
@@ -194,21 +224,51 @@ on success. On failure it leaves resources in place for investigation.
 
 ## Usage
 
-### nginx Ingress with automatic TLS
+### Kubernetes Gateway API with HTTPRoute (recommended)
+
+`setup.sh` creates a shared `Gateway` in `istio-system` backed by the
+`gateway-istio` pod on ports 80/443. HTTPRoutes from any namespace attach to
+it via `parentRefs`.
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: my-app
+  namespace: my-namespace
+spec:
+  parentRefs:
+    - name: gateway
+      namespace: istio-system
+  hostnames:
+    - my-app.localhost.localdomain
+  rules:
+    - backendRefs:
+        - name: my-app-svc
+          port: 80
+```
+
+Access: `https://my-app.localhost.localdomain` (HTTPS terminated at the Gateway
+using the wildcard cert `istio-system/istio-gw-tls`).
+
+---
+
+### Classic Ingress with automatic TLS
+
+Use `ingressClassName: istio` instead of `nginx`. For HTTPS, reference the
+shared wildcard secret `istio-gw-tls` (in `istio-system`) in the `tls:` block —
+Istio reads it from there and terminates TLS for the matching hostname.
 
 ```yaml
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
   name: my-app
-  annotations:
-    cert-manager.io/cluster-issuer: local-ca-issuer
-    nginx.ingress.kubernetes.io/ssl-redirect: "true"
 spec:
-  ingressClassName: nginx
+  ingressClassName: istio
   tls:
     - hosts: [my-app.localhost.localdomain]
-      secretName: my-app-tls
+      secretName: istio-gw-tls   # shared wildcard cert in istio-system
   rules:
     - host: my-app.localhost.localdomain
       http:
@@ -226,7 +286,7 @@ Access: `https://my-app.localhost.localdomain`
 
 ---
 
-### Istio Gateway + VirtualService
+### Istio Gateway + VirtualService (Istio native)
 
 `setup.sh` provisions a wildcard TLS certificate (`istio-system/istio-gw-tls`) shared
 by all Gateways via `credentialName`.
@@ -270,8 +330,8 @@ spec:
 ```
 
 Access:
-- HTTP:  `http://my-app.localhost.localdomain:8080`
-- HTTPS: `https://my-app.localhost.localdomain:8443`
+- HTTP:  `http://my-app.localhost.localdomain`
+- HTTPS: `https://my-app.localhost.localdomain`
 
 > **Per-service TLS**: create a `Certificate` in `istio-system` with your desired
 > `secretName` and reference it as `credentialName` in the Gateway.
@@ -351,6 +411,7 @@ sudo security add-trusted-cert -d -r trustRoot \
 ## Tear down
 
 ```bash
+# Use the cluster name from your .env (default: local-dev)
 kind delete cluster --name local-dev
 
 # Optional — removes all persistent data
@@ -359,12 +420,43 @@ sudo rm -rf /var/local-path-provisioner
 
 ---
 
+## Registry mirrors / Docker Hub proxy
+
+`setup.sh` writes containerd `hosts.toml` files directly into each node and
+restarts containerd — **no cluster recreation required**. Edit the `MIRRORS`
+array in `.env` and re-run:
+
+```bash
+MIRRORS=(
+  "https://dockerhub.timeweb.cloud"
+  "https://dockerhub1.beget.com"
+  "https://mirror.gcr.io"
+)
+```
+
+```bash
+./setup.sh   # idempotent — reconfigures mirrors on the running cluster
+```
+
+Mirrors are tried in order; the original registry is used as a fallback.
+
+To verify mirrors are active on a running node:
+
+```bash
+docker exec ${CLUSTER_NAME}-control-plane \
+  cat /etc/containerd/certs.d/docker.io/hosts.toml
+```
+
+---
+
+
 ## Troubleshooting
 
 | Problem | Fix |
 |---------|-----|
 | Port 80/443 already in use | Stop any local web server: `sudo lsof -i :80` |
 | DNS not resolving | Check dnsmasq is running: `sudo brew services list \| grep dnsmasq`; flush cache: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder` |
+| Ingress not routing | Confirm `ingressClassName: istio` is set (not `nginx`) |
 | Istio pods pending | Ensure Docker Desktop has ≥ 4 CPU / 8 GB RAM allocated |
 | TLS cert not issued | `kubectl describe certificaterequest -A` and check cert-manager logs |
 | ImagePullBackOff (public image) | Edit `MIRRORS` in `.env`, re-run `./setup.sh` (no `--recreate` needed) |

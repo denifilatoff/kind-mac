@@ -8,19 +8,8 @@ networking:
 nodes:
   - role: control-plane
     image: kindest/node:${K8S_VERSION}
-    kubeadmConfigPatches:
-      - |
-        kind: InitConfiguration
-        nodeRegistration:
-          kubeletExtraArgs:
-            node-labels: "ingress-ready=true"
     extraPortMappings:
-      - containerPort: ${NGINX_HTTP_PORT}
-        hostPort: ${NGINX_HTTP_PORT}
-        protocol: TCP
-      - containerPort: ${NGINX_HTTPS_PORT}
-        hostPort: ${NGINX_HTTPS_PORT}
-        protocol: TCP
+      # Istio gateway-istio (NodePort) — handles HTTPRoute, Ingress, and VirtualService
       - containerPort: ${ISTIO_NODEPORT_HTTP}
         hostPort: ${ISTIO_HTTP_PORT}
         protocol: TCP
@@ -30,15 +19,21 @@ nodes:
     extraMounts:
       - hostPath: ${STORAGE_ROOT}
         containerPath: ${STORAGE_ROOT}
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
 
   - role: worker
     image: kindest/node:${K8S_VERSION}
     extraMounts:
       - hostPath: ${STORAGE_ROOT}
         containerPath: ${STORAGE_ROOT}
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
 
   - role: worker
     image: kindest/node:${K8S_VERSION}
     extraMounts:
       - hostPath: ${STORAGE_ROOT}
         containerPath: ${STORAGE_ROOT}
+      - hostPath: /var/run/docker.sock
+        containerPath: /var/run/docker.sock
