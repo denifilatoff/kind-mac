@@ -5,32 +5,11 @@ name: ${CLUSTER_NAME}
 networking:
   apiServerAddress: "127.0.0.1"
 
+# The control-plane node always exists. setup.sh appends, in order:
+#   - host port mappings (kind-ports.yaml) only when ENABLE_INGRESS=true
+#   - worker nodes (kind-worker.yaml) unless SINGLE_NODE=true
 nodes:
   - role: control-plane
-    image: kindest/node:${K8S_VERSION}
-    extraPortMappings:
-      # Istio gateway-istio (NodePort) — handles HTTPRoute, Ingress, and VirtualService
-      - containerPort: ${ISTIO_NODEPORT_HTTP}
-        hostPort: ${ISTIO_HTTP_PORT}
-        protocol: TCP
-      - containerPort: ${ISTIO_NODEPORT_HTTPS}
-        hostPort: ${ISTIO_HTTPS_PORT}
-        protocol: TCP
-    extraMounts:
-      - hostPath: ${STORAGE_ROOT}
-        containerPath: ${STORAGE_ROOT}
-      - hostPath: /var/run/docker.sock
-        containerPath: /var/run/docker.sock
-
-  - role: worker
-    image: kindest/node:${K8S_VERSION}
-    extraMounts:
-      - hostPath: ${STORAGE_ROOT}
-        containerPath: ${STORAGE_ROOT}
-      - hostPath: /var/run/docker.sock
-        containerPath: /var/run/docker.sock
-
-  - role: worker
     image: kindest/node:${K8S_VERSION}
     extraMounts:
       - hostPath: ${STORAGE_ROOT}

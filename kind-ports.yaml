@@ -1,0 +1,13 @@
+    # Host port mappings for the control-plane node. Appended by setup.sh only
+    # when ENABLE_INGRESS=true, because these forward to the gateway-istio
+    # NodePort, which exists only when the ingress stack is installed. With
+    # ingress off, publishing these ports binds host 80/443 to nothing and
+    # collides with any other cluster already holding them.
+    extraPortMappings:
+      # Istio gateway-istio (NodePort) — handles HTTPRoute, Ingress, and VirtualService
+      - containerPort: ${ISTIO_NODEPORT_HTTP}
+        hostPort: ${ISTIO_HTTP_PORT}
+        protocol: TCP
+      - containerPort: ${ISTIO_NODEPORT_HTTPS}
+        hostPort: ${ISTIO_HTTPS_PORT}
+        protocol: TCP

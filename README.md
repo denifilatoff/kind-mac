@@ -6,37 +6,54 @@
 
 A script-driven local Kubernetes cluster for development on macOS. One command gives you:
 
-- **kind** cluster (1 control-plane + 2 workers) — always
+- **kind** cluster (1 control-plane + 2 workers, or a single control-plane node with `SINGLE_NODE=true`) — always
 - **persistent storage** backed by a host directory — always
 - **Istio** service mesh + single ingress gateway on ports 80/443 (HTTPRoute, classic Ingress, Istio Gateway+VirtualService) — optional, `ENABLE_INGRESS`
 - **cert-manager** with a self-signed CA (automatic TLS for `*.localhost.localdomain`) — part of ingress
 - **local Docker registry** on `localhost:5001` (no `kind load` needed) — optional, `ENABLE_REGISTRY`
 
+## Working in this repo
+
+`./setup.sh` is the single entry point. It is idempotent: the same command
+creates a new cluster or upgrades an existing one. `./smoke-test.sh` verifies a
+running cluster, and `./kbuild` builds an image and pushes it to the local registry.
+
+Confirm these with the user before running `setup.sh`:
+
+- **Ingress.** `ENABLE_INGRESS` (default `true`) installs Istio and cert-manager
+  and binds host ports 80/443. Turn it off for a bare cluster — then nothing
+  binds 80/443.
+- **Topology.** `SINGLE_NODE` (default `false`) gives 1 control-plane and 2
+  workers. Set it to `true` for a lighter control-plane-only cluster.
+- **Free ports.** With ingress on, host ports 80/443 must be free — another kind
+  cluster or a local web server can hold them. `setup.sh` checks first and exits
+  naming the holder; override with `ISTIO_HTTP_PORT` / `ISTIO_HTTPS_PORT`.
+- **One-time host setup.** DNS and the storage directory must exist (see
+  [One-time setup](#one-time-setup)). `setup.sh` checks both and exits with the
+  fix if either is missing.
+
+Settings live in `.env` (copy from `.env.example`). `setup.sh` assembles the
+cluster topology from `kind-config.yaml` (control-plane), `kind-ports.yaml`
+(host ports, ingress only), and `kind-worker.yaml` (each worker). Read those
+files for the exact node spec.
+
 ---
 
 ## Quick start
 
+First time only: complete the [one-time host setup](#one-time-setup) (DNS +
+storage). Then:
+
 ```bash
-# 1. One-time: DNS + storage (see details below)
-brew install dnsmasq
-echo 'address=/.localhost.localdomain/127.0.0.1' >> $(brew --prefix)/etc/dnsmasq.conf
-sudo brew services start dnsmasq
-sudo mkdir -p /etc/resolver
-echo 'nameserver 127.0.0.1' | sudo tee /etc/resolver/localhost.localdomain
-sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder
-sudo mkdir -p /var/local-path-provisioner && sudo chmod 777 /var/local-path-provisioner
+cp .env.example .env     # adjust if needed
+./setup.sh               # create or upgrade the cluster
+./smoke-test.sh          # verify
+```
 
-# 2. Copy and (optionally) edit cluster config
-cp .env.example .env
+Recreate from scratch, optionally wiping persistent storage:
 
-# 3. Create the cluster
-./setup.sh
-
-# 4. Verify everything works
-./smoke-test.sh
-
-# Recreate the cluster from scratch + wipe persistent storage
-./setup.sh --recreate --clean-storage
+```bash
+./setup.sh --recreate [--clean-storage]
 ```
 
 ---
@@ -169,6 +186,14 @@ MIRRORS=(
 # Feature toggles — set to "false" to skip a whole block of components
 ENABLE_INGRESS=true    # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
 ENABLE_REGISTRY=true   # local kind-registry + Docker Hub mirrors + containerd no-proxy
+
+# Cluster topology
+SINGLE_NODE=false      # true → control-plane only (no workers)
+
+# Ingress host ports — bound only when ENABLE_INGRESS=true.
+# Change these to run a second cluster alongside one that already holds 80/443.
+ISTIO_HTTP_PORT=80
+ISTIO_HTTPS_PORT=443
 ```
 
 Precedence: **env var > `.env` > in-script default**. So you can pin a flag in
@@ -207,9 +232,28 @@ kubectl config use-context kind-my-cluster
 kind delete cluster --name my-cluster
 ```
 
-> Running multiple kind clusters at once requires unique `ISTIO_HTTP_PORT` /
-> `ISTIO_HTTPS_PORT` values per cluster — only one cluster can bind host
-> ports 80/443 at a time.
+> **Host ports 80/443.** kind binds them only when `ENABLE_INGRESS=true`, so a
+> bare cluster (`ENABLE_INGRESS=false`) never conflicts and can run alongside
+> any other. With ingress on, only one cluster can hold 80/443 at a time:
+> `setup.sh` checks the ports first and exits naming the holder if they are
+> taken. Give each ingress-enabled cluster its own `ISTIO_HTTP_PORT` /
+> `ISTIO_HTTPS_PORT` to run several at once.
+
+### Single-node cluster
+
+By default the cluster has 1 control-plane node and 2 worker nodes. Set
+`SINGLE_NODE=true` to run a control-plane-only cluster — kind leaves that node
+schedulable, so every workload lands on it. This uses less memory and starts
+faster, at the cost of not exercising multi-node scheduling.
+
+```bash
+# One-off single-node cluster
+SINGLE_NODE=true ./setup.sh --recreate
+
+# Or pin it in .env
+echo 'SINGLE_NODE=true' >> .env
+./setup.sh --recreate
+```
 
 ### Optional features
 
@@ -454,16 +498,8 @@ sudo rm -rf /var/local-path-provisioner
 ## Registry mirrors / Docker Hub proxy
 
 `setup.sh` writes containerd `hosts.toml` files directly into each node and
-restarts containerd — **no cluster recreation required**. Edit the `MIRRORS`
-array in `.env` and re-run:
-
-```bash
-MIRRORS=(
-  "https://dockerhub.timeweb.cloud"
-  "https://dockerhub1.beget.com"
-  "https://mirror.gcr.io"
-)
-```
+restarts containerd — no cluster recreation required. Edit the `MIRRORS` array
+in `.env` (see [Configuration](#configuration)) and re-run:
 
 ```bash
 ./setup.sh   # idempotent — reconfigures mirrors on the running cluster
@@ -485,7 +521,7 @@ docker exec ${CLUSTER_NAME}-control-plane \
 
 | Problem | Fix |
 |---------|-----|
-| Port 80/443 already in use | Stop any local web server: `sudo lsof -i :80` |
+| Port 80/443 already in use (ingress on) | Free the holder (`sudo lsof -nP -iTCP:80 -sTCP:LISTEN`), or set `ISTIO_HTTP_PORT` / `ISTIO_HTTPS_PORT` in `.env`. A bare cluster (`ENABLE_INGRESS=false`) does not bind these ports. |
 | DNS not resolving | Check dnsmasq is running: `sudo brew services list \| grep dnsmasq`; flush cache: `sudo dscacheutil -flushcache && sudo killall -HUP mDNSResponder` |
 | Ingress not routing | Confirm `ingressClassName: istio` is set (not `nginx`) |
 | Istio pods pending | Ensure Docker Desktop has ≥ 4 CPU / 8 GB RAM allocated |

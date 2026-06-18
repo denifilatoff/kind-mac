@@ -51,6 +51,7 @@ MIRRORS=(
 # take precedence over the in-script defaults; .env (sourced below) overrides both.
 ENABLE_INGRESS="${ENABLE_INGRESS:-true}"   # cert-manager + Gateway API + Istio + IngressClass + wildcard TLS + ServiceMonitor CRD + DNS check
 ENABLE_REGISTRY="${ENABLE_REGISTRY:-true}" # local kind-registry container + KEP-1755 ConfigMap + Docker Hub mirrors + containerd no-proxy
+SINGLE_NODE="${SINGLE_NODE:-false}"        # true → control-plane only (no workers); false → 1 control-plane + 2 workers
 
 # ── Load .env (overrides defaults above) ──────────────────────────────────────
 [[ -f "${SCRIPT_DIR}/.env" ]] && source "${SCRIPT_DIR}/.env"
@@ -64,7 +65,18 @@ KIND_CONFIG="${SCRIPT_DIR}/.cache/kind-config.yaml"
 export CLUSTER_NAME K8S_VERSION \
        ISTIO_HTTP_PORT ISTIO_HTTPS_PORT ISTIO_NODEPORT_HTTP ISTIO_NODEPORT_HTTPS \
        STORAGE_ROOT
+# Control-plane node is always present. Append the host port mappings only when
+# ingress is enabled (they forward to the gateway-istio NodePort, which exists
+# only then), then append two worker nodes unless SINGLE_NODE=true.
 envsubst < "${SCRIPT_DIR}/kind-config.yaml" > "${KIND_CONFIG}"
+if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+  envsubst < "${SCRIPT_DIR}/kind-ports.yaml" >> "${KIND_CONFIG}"
+fi
+if [[ "${SINGLE_NODE}" != "true" ]]; then
+  for _ in 1 2; do
+    envsubst < "${SCRIPT_DIR}/kind-worker.yaml" >> "${KIND_CONFIG}"
+  done
+fi
 
 RECREATE=false
 CLEAN_STORAGE=false
@@ -199,6 +211,19 @@ if [[ "${CLEAN_STORAGE}" == "true" ]]; then
 fi
 
 if [[ "${CLUSTER_EXISTS}" == "false" ]]; then
+  # Ingress publishes host ports 80/443 (or the configured ISTIO_*_PORT). kind binds
+  # them at creation time, so fail early with an actionable message rather than a raw
+  # docker "Bind for 0.0.0.0:80 failed" if another process already holds them.
+  if [[ "${ENABLE_INGRESS}" == "true" ]]; then
+    for port in "${ISTIO_HTTP_PORT}" "${ISTIO_HTTPS_PORT}"; do
+      if lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1; then
+        holder="$(lsof -nP -iTCP:"${port}" -sTCP:LISTEN -Fc 2>/dev/null | sed -n 's/^c//p' | head -1)"
+        die "Host port ${port} is already in use${holder:+ by '${holder}'}. Free it, or set ISTIO_HTTP_PORT / ISTIO_HTTPS_PORT in .env to unused ports."
+      fi
+    done
+    ok "Host ports ${ISTIO_HTTP_PORT}/${ISTIO_HTTPS_PORT} are free"
+  fi
+
   log "Creating kind cluster '${CLUSTER_NAME}'"
   kind create cluster --config "${KIND_CONFIG}"
   ok "Cluster created"
@@ -726,6 +751,7 @@ cat <<SUMMARY
   Cluster '${CLUSTER_NAME}' is ready
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+  Topology: $([[ "${SINGLE_NODE}" == "true" ]] && echo "single-node (control-plane only)" || echo "1 control-plane + 2 workers")
   Features: ingress=${ENABLE_INGRESS}  registry=${ENABLE_REGISTRY}
 SUMMARY
 
